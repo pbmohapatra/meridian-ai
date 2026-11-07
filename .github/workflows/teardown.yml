@@ -1,0 +1,193 @@
+name: Teardown GCP Resources
+
+# Manual only: GitHub repo -> Actions -> "Teardown GCP Resources" -> Run workflow.
+# Nothing is deleted unless you type DELETE in the confirm box.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DELETE to permanently remove all Meridian resources"
+        required: true
+        default: ""
+      purge_build_bucket:
+        description: "Also delete the Cloud Build source bucket (<project>_cloudbuild)"
+        type: boolean
+        default: false
+      disable_apis:
+        description: "Also disable the app APIs (only if nothing else in the project uses them)"
+        type: boolean
+        default: false
+
+# Same group as the deploy workflow: if a deploy is running, teardown waits for it to finish.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE_NAME: meridian-ai-cloud-run
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/meridian-ai-cloud-run
+  VECTOR_BUCKET: gs://${{ secrets.GCP_PROJECT_ID }}-vector-staging
+  INDEX_NAME: financial-docs-production
+  ENDPOINT_NAME: financial-docs-endpoint
+  SECRET_NAME: GOOGLE_API_KEY
+
+jobs:
+  teardown:
+    name: Delete all resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Safety lock: the job is skipped unless the confirm box says exactly DELETE.
+    if: ${{ inputs.confirm == 'DELETE' }}
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # --- 1. Cloud Run (stop the app first) ---
+      - name: 1. Delete Cloud Run service
+        run: |
+          if gcloud run services describe "$SERVICE_NAME" --region="$REGION" >/dev/null 2>&1; then
+            gcloud run services delete "$SERVICE_NAME" --region="$REGION" --quiet
+            echo "Deleted Cloud Run service $SERVICE_NAME"
+          else
+            echo "Cloud Run service not found. Skipping."
+          fi
+
+      # --- 2. Vector Search: undeploy and wait (10-20 min) ---
+      - name: 2. Undeploy Vector Search index
+        timeout-minutes: 50
+        run: |
+          ENDPOINT_ID=$(gcloud ai index-endpoints list --region="$REGION" \
+            --filter="displayName=$ENDPOINT_NAME" --format="value(name)" --limit=1)
+          if [ -z "$ENDPOINT_ID" ]; then
+            echo "Endpoint not found. Skipping."
+            exit 0
+          fi
+
+          DEPLOYED=$(gcloud ai index-endpoints describe "$ENDPOINT_ID" --region="$REGION" \
+            --format="value(deployedIndexes.id)" | tr ';' ' ')
+          if [ -z "$DEPLOYED" ]; then
+            echo "Nothing deployed on the endpoint. Skipping."
+            exit 0
+          fi
+
+          for DID in $DEPLOYED; do
+            echo "Starting undeploy of $DID..."
+            # If an undeploy is already running, this errors; we just wait for it below.
+            gcloud ai index-endpoints undeploy-index "$ENDPOINT_ID" \
+              --deployed-index-id="$DID" --region="$REGION" --quiet \
+              || echo "Undeploy already in progress for $DID. Waiting for it."
+          done
+
+          for attempt in $(seq 1 45); do
+            STILL=$(gcloud ai index-endpoints describe "$ENDPOINT_ID" --region="$REGION" \
+              --format="value(deployedIndexes.id)")
+            if [ -z "$STILL" ]; then
+              echo "Undeploy complete."
+              exit 0
+            fi
+            echo "Attempt $attempt/45: still undeploying ($STILL). Waiting 60 seconds..."
+            sleep 60
+          done
+          echo "ERROR: still deployed after 45 minutes. Check the console, then run this workflow again."
+          exit 1
+
+      - name: 3. Delete Vector Search endpoint and index
+        run: |
+          for EP in $(gcloud ai index-endpoints list --region="$REGION" \
+              --filter="displayName=$ENDPOINT_NAME" --format="value(name)"); do
+            gcloud ai index-endpoints delete "$EP" --region="$REGION" --quiet
+            echo "Deleted endpoint $EP"
+          done
+
+          for IDX in $(gcloud ai indexes list --region="$REGION" \
+              --filter="displayName=$INDEX_NAME" --format="value(name)"); do
+            gcloud ai indexes delete "$IDX" --region="$REGION" --quiet
+            echo "Deleted index $IDX"
+          done
+
+      # --- 3. Secret ---
+      - name: 4. Delete secret
+        run: |
+          if gcloud secrets describe "$SECRET_NAME" >/dev/null 2>&1; then
+            gcloud secrets delete "$SECRET_NAME" --quiet
+            echo "Deleted secret $SECRET_NAME"
+          else
+            echo "Secret not found. Skipping."
+          fi
+
+      # --- 4. Container image (all builds, not just latest) ---
+      - name: 5. Delete container images
+        run: |
+          DIGESTS=$(gcloud container images list-tags "$IMAGE_NAME" --format="get(digest)" 2>/dev/null || true)
+          if [ -z "$DIGESTS" ]; then
+            echo "No images found. Skipping."
+            exit 0
+          fi
+          for D in $DIGESTS; do
+            gcloud container images delete "${IMAGE_NAME}@${D}" --force-delete-tags --quiet
+            echo "Deleted ${IMAGE_NAME}@${D}"
+          done
+
+      # --- 5. Storage ---
+      - name: 6. Delete storage buckets
+        run: |
+          if gcloud storage buckets describe "$VECTOR_BUCKET" >/dev/null 2>&1; then
+            gcloud storage rm --recursive "$VECTOR_BUCKET" --quiet
+            echo "Deleted $VECTOR_BUCKET"
+          else
+            echo "Vector bucket not found. Skipping."
+          fi
+
+          if [ "${{ inputs.purge_build_bucket }}" = "true" ]; then
+            BUILD_BUCKET="gs://${PROJECT_ID}_cloudbuild"
+            if gcloud storage buckets describe "$BUILD_BUCKET" >/dev/null 2>&1; then
+              gcloud storage rm --recursive "$BUILD_BUCKET" --quiet
+              echo "Deleted $BUILD_BUCKET"
+            else
+              echo "Build bucket not found. Skipping."
+            fi
+          fi
+
+      # --- 6. IAM (last, so earlier steps still had permission) ---
+      - name: 7. Remove IAM roles from the default compute service account
+        run: |
+          PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+          SA="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          for ROLE in roles/secretmanager.secretAccessor roles/cloudbuild.builds.builder \
+                      roles/aiplatform.user roles/storage.objectAdmin; do
+            gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+              --member="$SA" --role="$ROLE" --condition=None --quiet --format=none \
+              && echo "Removed $ROLE" \
+              || echo "$ROLE was not bound. Skipping."
+          done
+          # The deployer's own roles (secretmanager.admin, run.admin) are kept on purpose:
+          # removing them from inside this workflow would lock the workflow out.
+
+      # --- Optional: APIs ---
+      - name: 8. Disable app APIs (optional)
+        if: ${{ inputs.disable_apis }}
+        run: |
+          gcloud services disable \
+            aiplatform.googleapis.com run.googleapis.com secretmanager.googleapis.com \
+            cloudbuild.googleapis.com artifactregistry.googleapis.com \
+            generativelanguage.googleapis.com cloudtrace.googleapis.com \
+            --force --quiet
+
+      - name: 9. Final check
+        run: |
+          echo "--- Cloud Run ---";        gcloud run services list --region="$REGION" || true
+          echo "--- Index endpoints ---";  gcloud ai index-endpoints list --region="$REGION" || true
+          echo "--- Indexes ---";          gcloud ai indexes list --region="$REGION" || true
+          echo "--- Secrets ---";          gcloud secrets list || true
+          echo "--- Buckets ---";          gcloud storage ls || true
+          echo "Teardown finished. Remember to disable the 'Deploy to GCP Cloud Run' workflow."
