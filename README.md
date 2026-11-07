@@ -460,3 +460,39 @@ When something fails, read the last lines in the terminal. The app writes a diar
 ---
 
 *Aldermoor Industries and all sample data are fictional.*
+
+
+
+# For Clearing the resources
+
+Open your repo, then the Actions tab.
+In the left list, click Teardown GCP Resources.
+Click Run workflow on the right.
+Type DELETE in the confirm box and leave the two checkboxes unticked.
+Click the green Run workflow button.
+
+## check the final confirmation
+
+run the bellow in the cloud cli
+
+export PROJECT_ID=meridian-ai-512803
+export REGION=us-central1
+gcloud config set project $PROJECT_ID >/dev/null 2>&1
+
+check() {  # check "<label>" "<command that prints something if the resource exists>"
+  if [ -n "$(eval "$2" 2>/dev/null)" ]; then echo "STILL EXISTS  $1"; else echo "GONE          $1"; fi
+}
+
+check "Cloud Run service"     "gcloud run services list --region=$REGION --filter='metadata.name=meridian-ai-cloud-run' --format='value(metadata.name)'"
+check "Vector Search endpoint" "gcloud ai index-endpoints list --region=$REGION --filter='displayName=financial-docs-endpoint' --format='value(name)'"
+check "Vector Search index"    "gcloud ai indexes list --region=$REGION --filter='displayName=financial-docs-production' --format='value(name)'"
+check "Secret GOOGLE_API_KEY"  "gcloud secrets list --filter='name~GOOGLE_API_KEY' --format='value(name)'"
+check "Container image"        "gcloud container images list-tags gcr.io/$PROJECT_ID/meridian-ai-cloud-run --format='value(digest)'"
+check "Vector staging bucket"  "gcloud storage ls | grep -- '-vector-staging'"
+
+SA="serviceAccount:$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
+for ROLE in roles/secretmanager.secretAccessor roles/cloudbuild.builds.builder roles/aiplatform.user roles/storage.objectAdmin; do
+  check "IAM $ROLE on compute SA" "gcloud projects get-iam-policy $PROJECT_ID --flatten='bindings[].members' --filter='bindings.role=$ROLE AND bindings.members=$SA' --format='value(bindings.role)'"
+done
+
+
