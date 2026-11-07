@@ -475,6 +475,7 @@ Click the green Run workflow button.
 
 run the bellow in the cloud cli
 
+```bash
 export PROJECT_ID=meridian-ai-512803
 export REGION=us-central1
 gcloud config set project $PROJECT_ID >/dev/null 2>&1
@@ -494,5 +495,6 @@ SA="serviceAccount:$(gcloud projects describe $PROJECT_ID --format='value(projec
 for ROLE in roles/secretmanager.secretAccessor roles/cloudbuild.builds.builder roles/aiplatform.user roles/storage.objectAdmin; do
   check "IAM $ROLE on compute SA" "gcloud projects get-iam-policy $PROJECT_ID --flatten='bindings[].members' --filter='bindings.role=$ROLE AND bindings.members=$SA' --format='value(bindings.role)'"
 done
+```
 
 
